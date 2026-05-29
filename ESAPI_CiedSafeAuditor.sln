@@ -1,0 +1,25 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 18
+VisualStudioVersion = 18.6.11822.322 stable
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ESAPI_CiedSafetyAuditor", "ESAPI_CiedSafetyAuditor.csproj", "{23C4219E-D56D-4280-9B95-9FED9CC15E13}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Release|x64 = Release|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{23C4219E-D56D-4280-9B95-9FED9CC15E13}.Debug|x64.ActiveCfg = Debug|x64
+		{23C4219E-D56D-4280-9B95-9FED9CC15E13}.Debug|x64.Build.0 = Debug|x64
+		{23C4219E-D56D-4280-9B95-9FED9CC15E13}.Release|x64.ActiveCfg = Release|x64
+		{23C4219E-D56D-4280-9B95-9FED9CC15E13}.Release|x64.Build.0 = Release|x64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {3983CC39-AB93-43A8-872F-DF308BD9ABCC}
+	EndGlobalSection
+EndGlobal
