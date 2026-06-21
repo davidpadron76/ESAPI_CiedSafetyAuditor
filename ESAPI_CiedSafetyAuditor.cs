@@ -142,7 +142,7 @@ namespace VMS.TPS
         }
     }
 
-    // 3. CLASE AUXILIAR - FASE 2 (Extractor Dosimétrico)
+    // 3. CLASE AUXILIAR - FASE 2 (Extractor Dosimétrico) - REFACTORIZADO
     public class CiedDoseExtractor
     {
         private readonly PlanSetup _plan;
@@ -164,35 +164,41 @@ namespace VMS.TPS
                 throw new InvalidOperationException("La distribución de dosis no está disponible.");
             }
 
-            DoseValue rawDmax = _plan.GetDoseAtVolume(_cied, 0.0, VolumePresentation.Relative, DoseValuePresentation.Absolute);
-            DoseValue rawD5 = _plan.GetDoseAtVolume(_cied, 5.0, VolumePresentation.Relative, DoseValuePresentation.Absolute);
+            // ESAPI Best Practice: Use GetDVHCumulativeData for Max/Mean doses
+            DVHData dvh = _plan.GetDVHCumulativeData(_cied, DoseValuePresentation.Absolute, VolumePresentation.Relative, 0.001);
+            
+            if (dvh != null)
+            {
+                DmaxGy = ConvertToGy(dvh.MaxDose);
+            }
 
-            DmaxGy = ParseDoseStringToGy(rawDmax.ToString());
-            D5PercentGy = ParseDoseStringToGy(rawD5.ToString());
+            // For specific volume percentages, GetDoseAtVolume is correct
+            DoseValue rawD5 = _plan.GetDoseAtVolume(_cied, 5.0, VolumePresentation.Relative, DoseValuePresentation.Absolute);
+            D5PercentGy = ConvertToGy(rawD5);
         }
 
-        private double ParseDoseStringToGy(string doseString)
+        // ESAPI Best Practice: Direct property access instead of string parsing
+        private double ConvertToGy(DoseValue doseValue)
         {
-            if (string.IsNullOrEmpty(doseString)) return 0.0;
-            try
-            {
-                Match match = Regex.Match(doseString, @"([0-9\.,]+)\s*([a-zA-Z%]+)");
-                if (match.Success)
-                {
-                    string numeroTexto = match.Groups[1].Value.Replace(',', '.');
-                    string unidadTexto = match.Groups[2].Value.Trim();
-                    double valorNumerico = Convert.ToDouble(numeroTexto, System.Globalization.CultureInfo.InvariantCulture);
+            if (doseValue == null) return 0.0;
 
-                    if (unidadTexto.Equals("Gy", StringComparison.OrdinalIgnoreCase)) return valorNumerico;
-                    if (unidadTexto.Equals("cGy", StringComparison.OrdinalIgnoreCase)) return valorNumerico / 100.0;
-                }
+            // DoseValue.Dose returns the numeric value as a double
+            // DoseValue.Unit returns an enum (Gy, cGy, %, Unknown)
+            if (doseValue.Unit == DoseValue.DoseUnit.cGy)
+            {
+                return doseValue.Dose / 100.0;
             }
-            catch { return 0.0; }
-            return 0.0;
+            else if (doseValue.Unit == DoseValue.DoseUnit.Gy)
+            {
+                return doseValue.Dose;
+            }
+            
+            // Fallback if relative or unknown
+            return 0.0; 
         }
     }
 
-    // 4. CLASE AUXILIAR - FASE 3 (Auditor de Haces y Distancias)
+    // 4. CLASE AUXILIAR - FASE 3 (Auditor de Haces y Distancias) - REFACTORIZADO
     public class CiedBeamAuditor
     {
         private readonly PlanSetup _plan;
@@ -215,6 +221,7 @@ namespace VMS.TPS
         {
             int maxEnergyFound = 0;
 
+            // ESAPI Best Practice: MeshGeometry.Bounds gives the 3D bounding box
             var bounds = _cied.MeshGeometry.Bounds;
             double ciedX = bounds.X + (bounds.SizeX / 2.0);
             double ciedY = bounds.Y + (bounds.SizeY / 2.0);
@@ -222,7 +229,8 @@ namespace VMS.TPS
 
             foreach (Beam beam in _plan.Beams)
             {
-                if (beam.Id.ToUpper().Contains("SETUP"))
+                // ESAPI Best Practice: Use native API property instead of string matching
+                if (beam.IsSetupField)
                 {
                     continue;
                 }
@@ -250,12 +258,14 @@ namespace VMS.TPS
 
                 VVector beamIsocenter = beam.IsocenterPosition;
 
+                // Isocenter positions in ESAPI are in millimeters. Dividing by 10 converts to cm.
                 double deltaX = (ciedX - beamIsocenter.x) / 10.0;
                 double deltaY = (ciedY - beamIsocenter.y) / 10.0;
                 double deltaZ = (ciedZ - beamIsocenter.z) / 10.0;
 
                 double distanceToIsocenter = Math.Sqrt(deltaX * deltaX + deltaY * deltaY + deltaZ * deltaZ);
 
+                // Geometric heuristic: subtract approximate half-field size (5cm)
                 double fieldApproximation = distanceToIsocenter - 5.0;
                 if (fieldApproximation < 0.0) fieldApproximation = 0.0;
 
