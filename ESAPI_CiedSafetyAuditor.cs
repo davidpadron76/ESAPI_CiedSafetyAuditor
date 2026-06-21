@@ -142,7 +142,7 @@ namespace VMS.TPS
         }
     }
 
-    // 3. CLASE AUXILIAR - FASE 2 (Extractor Dosimétrico) - REFACTORIZADO
+    // 3. CLASE AUXILIAR - FASE 2 (Extractor Dosimétrico)
     public class CiedDoseExtractor
     {
         private readonly PlanSetup _plan;
@@ -164,7 +164,7 @@ namespace VMS.TPS
                 throw new InvalidOperationException("La distribución de dosis no está disponible.");
             }
 
-            // ESAPI Best Practice: Use GetDVHCumulativeData for Max/Mean doses
+            // Use GetDVHCumulativeData for Max/Mean doses
             DVHData dvh = _plan.GetDVHCumulativeData(_cied, DoseValuePresentation.Absolute, VolumePresentation.Relative, 0.001);
             
             if (dvh != null)
@@ -177,7 +177,7 @@ namespace VMS.TPS
             D5PercentGy = ConvertToGy(rawD5);
         }
 
-        // ESAPI Best Practice: Direct property access instead of string parsing
+        // Direct property access instead of string parsing
         private double ConvertToGy(DoseValue doseValue)
         {
             if (doseValue == null) return 0.0;
@@ -198,7 +198,7 @@ namespace VMS.TPS
         }
     }
 
-    // 4. CLASE AUXILIAR - FASE 3 (Auditor de Haces y Distancias) - REFACTORIZADO
+    // 4. CLASE AUXILIAR - FASE 3 (Auditor de Haces y Distancias)
     public class CiedBeamAuditor
     {
         private readonly PlanSetup _plan;
@@ -221,7 +221,7 @@ namespace VMS.TPS
         {
             int maxEnergyFound = 0;
 
-            // ESAPI Best Practice: MeshGeometry.Bounds gives the 3D bounding box
+            // MeshGeometry.Bounds gives the 3D bounding box
             var bounds = _cied.MeshGeometry.Bounds;
             double ciedX = bounds.X + (bounds.SizeX / 2.0);
             double ciedY = bounds.Y + (bounds.SizeY / 2.0);
@@ -229,7 +229,7 @@ namespace VMS.TPS
 
             foreach (Beam beam in _plan.Beams)
             {
-                // ESAPI Best Practice: Use native API property instead of string matching
+                // Use native API property instead of string matching
                 if (beam.IsSetupField)
                 {
                     continue;
