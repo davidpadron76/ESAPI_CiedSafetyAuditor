@@ -111,10 +111,14 @@ namespace VMS.TPS
             _context = context;
         }
 
+        private static readonly Regex RegexCied = new Regex(
+          @"(cied|marcapaso|pacemaker|icd|desfibrilador|generador)",
+          RegexOptions.IgnoreCase | RegexOptions.Compiled
+        );
+
         public Structure FindCiedStructure()
         {
-            string patronBusqueda = @"(cied|marcapaso|pacemaker|icd|desfibrilador|generador)";
-            Regex regexCied = new Regex(patronBusqueda, RegexOptions.IgnoreCase);
+            List<Structure> candidatas = new List<Structure>();
 
             foreach (Structure structure in _context.StructureSet.Structures)
             {
@@ -123,22 +127,53 @@ namespace VMS.TPS
                     continue;
                 }
 
-                if (regexCied.IsMatch(structure.Id))
+                if (RegexCied.IsMatch(structure.Id))
                 {
-                    return structure;
+                    candidatas.Add(structure);
                 }
             }
 
+            if (candidatas.Count == 0)
+            {
+                MessageBox.Show(
+                  "ALERTA DE PROTECCIÓN RADIOLÓGICA:\n\n" +
+                  "No se encontró ninguna estructura asociada a un dispositivo cardíaco (CIED) en el plan activo.\n\n" +
+                  "Asegúrese de que el dispositivo esté contorneado de forma correcta.",
+                  "Barrera de Seguridad - Estructura Ausente",
+                  MessageBoxButton.OK,
+                  MessageBoxImage.Warning
+                );
+
+                return null;
+            }
+
+            if (candidatas.Count == 1)
+            {
+                return candidatas[0];
+            }
+
+            // El orden de StructureSet.Structures no está garantizado por ESAPI, así que con
+            // varias coincidencias (p.ej. "CIED" y "CIED_PRV") no se puede tomar la primera sin
+            // riesgo de resultados no deterministas. Se elige la de menor volumen (heurística: el
+            // contorno del dispositivo suele ser más pequeño que un PRV o una expansión) y se
+            // informa explícitamente al usuario para que verifique la selección.
+            Structure seleccionada = candidatas.OrderBy(s => s.Volume).First();
+            string listaCandidatas = string.Join(", ", candidatas.Select(s => s.Id).ToArray());
+
             MessageBox.Show(
-              "ALERTA DE PROTECCIÓN RADIOLÓGICA:\n\n" +
-              "No se encontró ninguna estructura asociada a un dispositivo cardíaco (CIED) en el plan activo.\n\n" +
-              "Asegúrese de que el dispositivo esté contorneado de forma correcta.",
-              "Barrera de Seguridad - Estructura Ausente",
+              string.Format(
+                "Se detectaron múltiples estructuras candidatas a CIED: {0}.\n\n" +
+                "Se seleccionó automáticamente '{1}' por tener el menor volumen.\n\n" +
+                "Verifique que esta selección sea la correcta antes de confiar en el reporte.",
+                listaCandidatas,
+                seleccionada.Id
+              ),
+              "Selección Automática de Estructura CIED",
               MessageBoxButton.OK,
               MessageBoxImage.Warning
             );
 
-            return null;
+            return seleccionada;
         }
     }
 
@@ -164,9 +199,11 @@ namespace VMS.TPS
                 throw new InvalidOperationException("La distribución de dosis no está disponible.");
             }
 
-            // Use GetDVHCumulativeData for Max/Mean doses
-            DVHData dvh = _plan.GetDVHCumulativeData(_cied, DoseValuePresentation.Absolute, VolumePresentation.Relative, 0.001);
-            
+            // MaxDose no depende del ancho de bin (solo CurveData lo usa), así que un bin fino
+            // de 0.001 Gy solo desperdicia memoria construyendo una curva que nunca se lee
+            // (decenas de miles de puntos en un rango típico de dosis). 0.1 Gy es suficiente.
+            DVHData dvh = _plan.GetDVHCumulativeData(_cied, DoseValuePresentation.Absolute, VolumePresentation.Relative, 0.1);
+
             if (dvh != null)
             {
                 DmaxGy = ConvertToGy(dvh.MaxDose);
@@ -221,6 +258,13 @@ namespace VMS.TPS
         {
             int maxEnergyFound = 0;
 
+            if (_cied.MeshGeometry == null)
+            {
+                throw new InvalidOperationException(
+                  "La estructura CIED no tiene una geometría de malla válida (contorno incompleto o vacío)."
+                );
+            }
+
             // MeshGeometry.Bounds gives the 3D bounding box
             var bounds = _cied.MeshGeometry.Bounds;
             double ciedX = bounds.X + (bounds.SizeX / 2.0);
@@ -238,15 +282,19 @@ namespace VMS.TPS
                 if (beam.EnergyMode != null)
                 {
                     string energyId = beam.EnergyMode.Id;
-                    MaxEnergyName = energyId;
 
                     Match matchEnergia = Regex.Match(energyId, @"\d+");
                     if (matchEnergia.Success)
                     {
                         int valorEnergia = Convert.ToInt32(matchEnergia.Value);
+
+                        // Solo se actualiza el nombre reportado cuando el haz es realmente el de
+                        // mayor energía vista hasta el momento; antes se sobrescribía en cada
+                        // iteración y el reporte terminaba mostrando el último haz, no el máximo.
                         if (valorEnergia > maxEnergyFound)
                         {
                             maxEnergyFound = valorEnergia;
+                            MaxEnergyName = energyId;
                         }
 
                         if (valorEnergia >= 10)
