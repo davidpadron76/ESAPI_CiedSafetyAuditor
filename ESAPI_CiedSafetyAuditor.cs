@@ -313,8 +313,28 @@ namespace VMS.TPS
 
                 double distanceToIsocenter = Math.Sqrt(deltaX * deltaX + deltaY * deltaY + deltaZ * deltaZ);
 
-                // Geometric heuristic: subtract approximate half-field size (5cm)
-                double fieldApproximation = distanceToIsocenter - 5.0;
+                // Geometric heuristic: usar el tamaño real de campo (jaws) del primer control
+                // point en vez de un valor fijo de 10x10cm. Se toma la mayor distancia jaw-a-eje
+                // de los cuatro bordes (X1, X2, Y1, Y2) para no subestimar el alcance del campo en
+                // colimación asimétrica; sigue sin considerar gantry/couch (ver limitación conocida),
+                // pero refleja la apertura configurada en vez de asumirla. Si no hay control points
+                // o jaws disponibles (p.ej. aplicador de electrones no estándar), se conserva el
+                // valor de respaldo de 5cm usado originalmente.
+                double fieldHalfSizeCm = 5.0;
+                ControlPoint firstControlPoint = beam.ControlPoints != null ? beam.ControlPoints.FirstOrDefault() : null;
+
+                if (firstControlPoint != null)
+                {
+                    var jaws = firstControlPoint.JawPositions;
+                    double maxReachMm = new[] { Math.Abs(jaws.X1), Math.Abs(jaws.X2), Math.Abs(jaws.Y1), Math.Abs(jaws.Y2) }.Max();
+
+                    if (maxReachMm > 0.0)
+                    {
+                        fieldHalfSizeCm = maxReachMm / 10.0;
+                    }
+                }
+
+                double fieldApproximation = distanceToIsocenter - fieldHalfSizeCm;
                 if (fieldApproximation < 0.0) fieldApproximation = 0.0;
 
                 if (fieldApproximation < MinDistanceToEdgeCm)
