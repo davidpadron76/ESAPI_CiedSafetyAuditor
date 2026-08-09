@@ -4,6 +4,7 @@ using System.Text;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
+using System.Windows.Media.Media3D;
 using System.Windows.Shapes;
 using System.Text.RegularExpressions;
 using System.Collections.Generic;
@@ -129,6 +130,7 @@ namespace VMS.TPS
 
             if (candidatas.Count == 1)
             {
+                WarnIfImplausibleDicomType(candidatas[0]);
                 return candidatas[0];
             }
 
@@ -153,7 +155,48 @@ namespace VMS.TPS
               MessageBoxImage.Warning
             );
 
+            WarnIfImplausibleDicomType(seleccionada);
             return seleccionada;
+        }
+
+        // Tipos DICOM que delatan que el patrón de búsqueda coincidió con algo que no es el
+        // contorno de un dispositivo: un volumen blanco (p.ej. una estructura llamada "ICD boost"
+        // interpretada como desfibrilador) o el contorno externo del paciente. No se valida contra
+        // una lista de tipos "permitidos" porque CONTROL, ORGAN y AVOIDANCE son todos usos
+        // legítimos según el flujo de contorneo de cada servicio, y alertar sobre ellos sería ruido.
+        private static readonly string[] TiposImplausibles = { "PTV", "GTV", "CTV", "EXTERNAL", "BODY" };
+
+        private void WarnIfImplausibleDicomType(Structure structure)
+        {
+            string tipo = structure.DicomType;
+
+            if (string.IsNullOrEmpty(tipo))
+            {
+                return;
+            }
+
+            bool esImplausible = TiposImplausibles
+              .Any(t => string.Equals(t, tipo, StringComparison.OrdinalIgnoreCase));
+
+            if (!esImplausible)
+            {
+                return;
+            }
+
+            MessageBox.Show(
+              string.Format(
+                "La estructura seleccionada como CIED ('{0}') tiene un tipo DICOM de '{1}'.\n\n" +
+                "Ese tipo corresponde a un volumen blanco o al contorno externo del paciente, no a un " +
+                "dispositivo implantado, por lo que es probable que el patrón de búsqueda haya " +
+                "coincidido con una estructura equivocada.\n\n" +
+                "Verifique la estructura antes de utilizar este reporte para tomar decisiones clínicas.",
+                structure.Id,
+                tipo
+              ),
+              "Advertencia - Tipo de Estructura Inesperado",
+              MessageBoxButton.OK,
+              MessageBoxImage.Warning
+            );
         }
     }
 
@@ -215,6 +258,188 @@ namespace VMS.TPS
         }
     }
 
+    // 4a. CLASE AUXILIAR - Proyección Beam's-Eye-View (IEC 61217)
+    //
+    // Proyecta puntos del paciente al sistema de coordenadas del haz para medir la distancia real
+    // al borde del campo, considerando gantry, colimador y camilla. Reemplaza la heurística previa
+    // (distancia radial al isocentro menos medio campo), que ignoraba por completo la orientación
+    // del haz y por lo tanto sobrestimaba la distancia en haces que no apuntaban hacia el CIED.
+    //
+    // ADVERTENCIA: las convenciones de signo de rotación (especialmente colimador y camilla) están
+    // documentadas explícitamente en cada bloque. Deben validarse contra casos conocidos antes de
+    // usar este cálculo con fines clínicos — ver sección de validación en el README.
+    public class BeamEyeViewProjector
+    {
+        // Distancia fuente-eje nominal de un acelerador lineal Varian, en mm.
+        private const double SourceAxisDistanceMm = 1000.0;
+
+        private readonly PatientOrientation _orientation;
+
+        public BeamEyeViewProjector(PatientOrientation orientation)
+        {
+            _orientation = orientation;
+        }
+
+        public static bool IsSupportedOrientation(PatientOrientation orientation)
+        {
+            return orientation == PatientOrientation.HeadFirstSupine
+                || orientation == PatientOrientation.HeadFirstProne
+                || orientation == PatientOrientation.FeetFirstSupine
+                || orientation == PatientOrientation.FeetFirstProne;
+        }
+
+        // Convierte los vértices de la malla desde coordenadas DICOM de paciente
+        // (+x = izquierda, +y = posterior, +z = superior) al sistema fijo IEC 61217
+        // (+Xf = derecha de un observador frente al gantry, +Yf = hacia el gantry, +Zf = arriba),
+        // relativos al isocentro del haz. Se hace una sola vez por haz porque no depende del
+        // control point, sólo de la orientación del paciente y del isocentro.
+        //
+        // Las cuatro combinaciones son transformaciones dextrógiras (determinante +1); las
+        // orientaciones laterales (decúbito lateral) no están soportadas y se rechazan antes.
+        public double[] ToIecFixedRelative(Point3DCollection points, VVector isocenter)
+        {
+            double[] resultado = new double[points.Count * 3];
+
+            for (int i = 0; i < points.Count; i++)
+            {
+                Point3D p = points[i];
+                double x = p.X - isocenter.x;
+                double y = p.Y - isocenter.y;
+                double z = p.Z - isocenter.z;
+
+                double xf, yf, zf;
+
+                if (_orientation == PatientOrientation.HeadFirstSupine)
+                {
+                    xf = x; yf = z; zf = -y;
+                }
+                else if (_orientation == PatientOrientation.HeadFirstProne)
+                {
+                    xf = -x; yf = z; zf = y;
+                }
+                else if (_orientation == PatientOrientation.FeetFirstSupine)
+                {
+                    xf = -x; yf = -z; zf = -y;
+                }
+                else
+                {
+                    xf = x; yf = -z; zf = y;
+                }
+
+                resultado[i * 3] = xf;
+                resultado[i * 3 + 1] = yf;
+                resultado[i * 3 + 2] = zf;
+            }
+
+            return resultado;
+        }
+
+        // Distancia mínima (mm) desde cualquier vértice del CIED hasta el borde del campo, medida
+        // en el plano perpendicular al haz que pasa por ese vértice. Devuelve 0.0 si algún vértice
+        // cae dentro del campo. Se evalúa para un único control point (un ángulo de gantry).
+        public double MinDistanceOutsideFieldMm(
+          double[] iecPoints,
+          double gantryDeg,
+          double collimatorDeg,
+          double couchDeg,
+          VRect<double> jaws)
+        {
+            // Base del haz en el sistema fijo IEC para el ángulo de gantry dado.
+            // Gantry 0 = fuente arriba, haz hacia abajo (-Zf). Gantry 90 = fuente del lado +Xf
+            // (izquierda del paciente en HFS), haz viajando hacia -Xf. Coincide con la escala IEC
+            // de Varian.
+            double gRad = gantryDeg * Math.PI / 180.0;
+            double cosG = Math.Cos(gRad);
+            double sinG = Math.Sin(gRad);
+
+            // Eje del haz, de la fuente hacia el isocentro.
+            double dirX = -sinG, dirY = 0.0, dirZ = -cosG;
+            // Crossplane (mordazas X) e inplane (mordazas Y) con el colimador en 0.
+            double crossX = cosG, crossY = 0.0, crossZ = -sinG;
+            double inplX = 0.0, inplY = 1.0, inplZ = 0.0;
+
+            // Rotación de colimador alrededor del eje del haz. Convención asumida: ángulo positivo
+            // gira el eje crossplane hacia el eje inplane. Con campos simétricos el signo es
+            // irrelevante; sólo importa en campos rectangulares asimétricos.
+            double cRad = collimatorDeg * Math.PI / 180.0;
+            double cosC = Math.Cos(cRad);
+            double sinC = Math.Sin(cRad);
+
+            double cx = crossX * cosC + inplX * sinC;
+            double cy = crossY * cosC + inplY * sinC;
+            double cz = crossZ * cosC + inplZ * sinC;
+            double ix = -crossX * sinC + inplX * cosC;
+            double iy = -crossY * sinC + inplY * cosC;
+            double iz = -crossZ * sinC + inplZ * cosC;
+
+            // Rotación de camilla alrededor del eje vertical Zf. El paciente gira con la camilla,
+            // así que se rota el punto (no el haz). Convención asumida: ángulo positivo es
+            // antihorario visto desde arriba. La mayoría de los planes usan camilla 0, donde esto
+            // no tiene efecto; con camilla distinta de 0 el signo debe validarse.
+            double pRad = couchDeg * Math.PI / 180.0;
+            double cosP = Math.Cos(pRad);
+            double sinP = Math.Sin(pRad);
+
+            // Las mordazas vienen definidas en el plano del isocentro. X1/Y1 son negativas y X2/Y2
+            // positivas en ESAPI, pero se ordenan por si acaso para no invertir el intervalo.
+            double xMin = Math.Min(jaws.X1, jaws.X2);
+            double xMax = Math.Max(jaws.X1, jaws.X2);
+            double yMin = Math.Min(jaws.Y1, jaws.Y2);
+            double yMax = Math.Max(jaws.Y1, jaws.Y2);
+
+            double minDistancia = double.MaxValue;
+            int totalPuntos = iecPoints.Length / 3;
+
+            for (int i = 0; i < totalPuntos; i++)
+            {
+                double xf = iecPoints[i * 3];
+                double yf = iecPoints[i * 3 + 1];
+                double zf = iecPoints[i * 3 + 2];
+
+                double xr = xf * cosP - yf * sinP;
+                double yr = xf * sinP + yf * cosP;
+                double zr = zf;
+
+                // Profundidad respecto al isocentro (positiva = más lejos de la fuente) y
+                // coordenadas en el plano del haz.
+                double depth = xr * dirX + yr * dirY + zr * dirZ;
+                double cross = xr * cx + yr * cy + zr * cz;
+                double inpl = xr * ix + yr * iy + zr * iz;
+
+                // El campo diverge con la distancia a la fuente, así que el borde se escala del
+                // plano del isocentro al plano donde está realmente el punto.
+                double divergencia = (SourceAxisDistanceMm + depth) / SourceAxisDistanceMm;
+                if (divergencia < 0.0)
+                {
+                    // Punto detrás de la fuente: geometría degenerada, no aporta información útil.
+                    continue;
+                }
+
+                double outCross = 0.0;
+                if (cross < xMin * divergencia) outCross = xMin * divergencia - cross;
+                else if (cross > xMax * divergencia) outCross = cross - xMax * divergencia;
+
+                double outInpl = 0.0;
+                if (inpl < yMin * divergencia) outInpl = yMin * divergencia - inpl;
+                else if (inpl > yMax * divergencia) outInpl = inpl - yMax * divergencia;
+
+                if (outCross <= 0.0 && outInpl <= 0.0)
+                {
+                    // Vértice dentro del campo: no puede haber una distancia menor que cero.
+                    return 0.0;
+                }
+
+                double distancia = Math.Sqrt(outCross * outCross + outInpl * outInpl);
+                if (distancia < minDistancia)
+                {
+                    minDistancia = distancia;
+                }
+            }
+
+            return minDistancia == double.MaxValue ? 0.0 : minDistancia;
+        }
+    }
+
     // 4. CLASE AUXILIAR - FASE 3 (Auditor de Haces y Distancias)
     public class CiedBeamAuditor
     {
@@ -245,11 +470,27 @@ namespace VMS.TPS
                 );
             }
 
-            // MeshGeometry.Bounds gives the 3D bounding box
-            var bounds = _cied.MeshGeometry.Bounds;
-            double ciedX = bounds.X + (bounds.SizeX / 2.0);
-            double ciedY = bounds.Y + (bounds.SizeY / 2.0);
-            double ciedZ = bounds.Z + (bounds.SizeZ / 2.0);
+            PatientOrientation orientation = _plan.TreatmentOrientation;
+
+            if (!BeamEyeViewProjector.IsSupportedOrientation(orientation))
+            {
+                throw new InvalidOperationException(
+                  string.Format(
+                    "La orientación de tratamiento '{0}' no está soportada por el cálculo geométrico " +
+                    "beam's-eye-view. Sólo se admiten HeadFirstSupine, HeadFirstProne, FeetFirstSupine " +
+                    "y FeetFirstProne.",
+                    orientation
+                  )
+                );
+            }
+
+            BeamEyeViewProjector projector = new BeamEyeViewProjector(orientation);
+            Point3DCollection meshPoints = _cied.MeshGeometry.Positions;
+
+            // Una vez que el CIED cae dentro del campo la distancia ya no puede bajar de cero, así
+            // que se deja de calcular geometría. El recorrido de haces continúa igualmente porque
+            // la energía máxima y la detección de neutrones sí dependen de todos los haces.
+            bool geometriaSaturada = false;
 
             foreach (Beam beam in _plan.Beams)
             {
@@ -284,42 +525,40 @@ namespace VMS.TPS
                     }
                 }
 
-                VVector beamIsocenter = beam.IsocenterPosition;
-
-                // Isocenter positions in ESAPI are in millimeters. Dividing by 10 converts to cm.
-                double deltaX = (ciedX - beamIsocenter.x) / 10.0;
-                double deltaY = (ciedY - beamIsocenter.y) / 10.0;
-                double deltaZ = (ciedZ - beamIsocenter.z) / 10.0;
-
-                double distanceToIsocenter = Math.Sqrt(deltaX * deltaX + deltaY * deltaY + deltaZ * deltaZ);
-
-                // Geometric heuristic: usar el tamaño real de campo (jaws) del primer control
-                // point en vez de un valor fijo de 10x10cm. Se toma la mayor distancia jaw-a-eje
-                // de los cuatro bordes (X1, X2, Y1, Y2) para no subestimar el alcance del campo en
-                // colimación asimétrica; sigue sin considerar gantry/couch (ver limitación conocida),
-                // pero refleja la apertura configurada en vez de asumirla. Si no hay control points
-                // o jaws disponibles (p.ej. aplicador de electrones no estándar), se conserva el
-                // valor de respaldo de 5cm usado originalmente.
-                double fieldHalfSizeCm = 5.0;
-                ControlPoint firstControlPoint = beam.ControlPoints != null ? beam.ControlPoints.FirstOrDefault() : null;
-
-                if (firstControlPoint != null)
+                if (geometriaSaturada || beam.ControlPoints == null || beam.ControlPoints.Count == 0)
                 {
-                    var jaws = firstControlPoint.JawPositions;
-                    double maxReachMm = new[] { Math.Abs(jaws.X1), Math.Abs(jaws.X2), Math.Abs(jaws.Y1), Math.Abs(jaws.Y2) }.Max();
-
-                    if (maxReachMm > 0.0)
-                    {
-                        fieldHalfSizeCm = maxReachMm / 10.0;
-                    }
+                    continue;
                 }
 
-                double fieldApproximation = distanceToIsocenter - fieldHalfSizeCm;
-                if (fieldApproximation < 0.0) fieldApproximation = 0.0;
+                // La conversión al sistema IEC sólo depende de la orientación y del isocentro, no
+                // del control point, así que se hace una vez por haz y se reutiliza en todos.
+                double[] iecPoints = projector.ToIecFixedRelative(meshPoints, beam.IsocenterPosition);
 
-                if (fieldApproximation < MinDistanceToEdgeCm)
+                // En VMAT el gantry (y las mordazas) cambian en cada control point, así que evaluar
+                // sólo el primero subestimaba groseramente el riesgo: basta con que un ángulo del
+                // arco apunte al CIED para que la distancia real sea cero.
+                foreach (ControlPoint controlPoint in beam.ControlPoints)
                 {
-                    MinDistanceToEdgeCm = fieldApproximation;
+                    double distanciaMm = projector.MinDistanceOutsideFieldMm(
+                      iecPoints,
+                      controlPoint.GantryAngle,
+                      controlPoint.CollimatorAngle,
+                      controlPoint.PatientSupportAngle,
+                      controlPoint.JawPositions
+                    );
+
+                    double distanciaCm = distanciaMm / 10.0;
+
+                    if (distanciaCm < MinDistanceToEdgeCm)
+                    {
+                        MinDistanceToEdgeCm = distanciaCm;
+                    }
+
+                    if (MinDistanceToEdgeCm <= 0.0)
+                    {
+                        geometriaSaturada = true;
+                        break;
+                    }
                 }
             }
 
@@ -500,7 +739,7 @@ namespace VMS.TPS
             ));
 
             mainStack.Children.Add(BuildItemRow(
-              "Distancia Mínima Estimada al Borde",
+              "Distancia Mínima al Borde de Campo (BEV, todos los ángulos)",
               string.Format("{0:F1} cm", beamAuditor.MinDistanceToEdgeCm),
               string.Format(
                 "Alto si < {0:F0}cm con neutrones   |   Moderado si < {0:F0}cm sin neutrones, o >= {0:F0}cm con neutrones   |   Bajo si >= {0:F0}cm sin neutrones",
