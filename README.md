@@ -10,14 +10,28 @@ El script está diseñado bajo un enfoque modular y unificado en un único archi
 
 * **Fase 1: Módulo de Contexto y Detección Estructural:** Identificación algorítmica del contorno del dispositivo en el `StructureSet` activo utilizando expresiones regulares (`RegEx`) insensibles a mayúsculas/minúsculas (`CIED`, `Marcapasos`, `ICD`, `Desfibrilador`). Si el patrón coincide con varias estructuras (por ejemplo `CIED` y `CIED_PRV` en el mismo plan), se selecciona automáticamente la de menor volumen y se advierte al usuario sobre las candidatas detectadas, evitando depender del orden no garantizado de `StructureSet.Structures`.
 * **Fase 2: Extracción Dosimétrica:** Interrogación directa de la distribución de dosis de Eclipse para aislar la Dosis Máxima (**Dmax**, vía `DVHData.MaxDose`, independiente de la resolución de bin) y la dosis en volumen (**D5%**, vía `GetDoseAtVolume`), sin depender de la interpolación de la curva DVH acumulada.
-* **Fase 3: Auditoría de Haces y Análisis Geométrico:** Inspección automatizada de las energías del plan para identificar umbrales críticos de contaminación por neutrones fotonucleares (mayor o igual a **10 MV**) y cálculo de la distancia euclidiana periférica mínima entre el isocentro de cada haz y los límites de la malla estructural (`MeshGeometry.Bounds`), restando el tamaño real de campo obtenido de las posiciones de jaws (`ControlPoint.JawPositions`) del primer control point.
+* **Fase 3: Auditoría de Haces y Análisis Geométrico *Beam's-Eye-View*:** Inspección automatizada de las energías del plan para identificar umbrales críticos de contaminación por neutrones fotonucleares (mayor o igual a **10 MV**) y cálculo de la distancia mínima real entre el dispositivo y el borde del campo. Cada vértice de la malla del CIED se transforma al sistema de coordenadas del haz según **IEC 61217**, aplicando la orientación del paciente, la rotación de gantry, colimador y camilla, y corrigiendo por divergencia del haz respecto al plano del isocentro. El recorrido cubre **todos los control points** de cada haz, de modo que en técnicas de arco (VMAT) se detecta cualquier ángulo del arco en que el dispositivo entre al campo — algo que una evaluación del primer control point pasaba por alto.
 * **Fase 4: Motor Clínico de Evaluación de Riesgo:** Clasificación algorítmica del nivel de riesgo del paciente (Bajo, Moderado, Alto) cruzando dosis, energía y distancia, desplegando de forma inmediata las barreras de control y recomendaciones médicas sugeridas por el TG-203.
 * **Reporte Visual con Semáforo por Ítem:** El resultado final se presenta en una ventana dedicada (no un simple `MessageBox`) con un indicador de color (verde/ámbar/rojo) y el umbral de referencia junto a cada medición (Dmax, energía/neutrones, distancia al borde), además del semáforo y veredicto global — así un usuario sin formación en dosimetría puede ver de un vistazo qué tan cerca o lejos está cada parámetro de cambiar de categoría de riesgo, no solo el resultado final.
 
+## ⚠️ Validación Pendiente del Cálculo Geométrico
+
+> **El cálculo *beam's-eye-view* de la Fase 3 no ha sido validado experimentalmente y no debe utilizarse como base de decisiones clínicas hasta que lo esté.**
+
+La transformación IEC 61217 implica convenciones de signo de rotación que dependen del fabricante y de la escala configurada en el acelerador. Las asumidas en el código están documentadas explícitamente en los comentarios de `BeamEyeViewProjector`, pero requieren verificación contra casos conocidos:
+
+1. **Campo único, gantry 0, CIED lateral al campo:** la distancia calculada debe coincidir con la medida manualmente sobre el corte axial en Eclipse.
+2. **Campo único, gantry 90 y 270:** verifica que el signo de la rotación de gantry sea correcto — un signo invertido intercambia los resultados de estos dos ángulos.
+3. **Campo rectangular asimétrico con colimador ≠ 0:** verifica la convención de rotación de colimador.
+4. **Plan con camilla ≠ 0:** verifica la convención de rotación de camilla, la menos ejercitada del conjunto ya que la mayoría de los planes usan camilla 0.
+5. **CIED deliberadamente dentro del campo:** debe reportar exactamente 0.0 cm.
+
 ## ⚠️ Limitaciones Conocidas
 
-* El cálculo de distancia al borde del campo usa el isocentro y el tamaño de jaws del haz, pero no proyecta la geometría a través de la rotación de gantry, colimador o camilla — es una aproximación geométrica simplificada, no un cálculo *beam's-eye-view* completo.
+* El cálculo geométrico considera únicamente la apertura de **mordazas (jaws)**; no evalúa el bloqueo real del **MLC**, por lo que un dispositivo situado dentro del rectángulo de jaws pero blindado por las láminas se reporta como si estuviese en el campo (comportamiento conservador).
 * La detección de neutrones por fotoactivación (≥10 MV) no distingue entre modalidad de fotones y electrones; se basa únicamente en el valor numérico de energía del haz.
+* Sólo se admiten las orientaciones de tratamiento HFS, HFP, FFS y FFP. Las orientaciones en decúbito lateral se rechazan explícitamente en lugar de calcularse de forma incorrecta.
+* La distancia fuente-eje se asume en el valor nominal de **1000 mm**.
 
 ## 🛠️ Requisitos e Instalación
 
