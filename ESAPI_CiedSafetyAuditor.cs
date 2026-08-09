@@ -2,6 +2,9 @@ using System;
 using System.Linq;
 using System.Text;
 using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Media;
+using System.Windows.Shapes;
 using System.Text.RegularExpressions;
 using System.Collections.Generic;
 using System.Reflection;
@@ -61,36 +64,13 @@ namespace VMS.TPS
                     );
                     riskEvaluator.EvaluateRisk();
 
-                    // REPORTE CLÍNICO CONSOLIDADO FINAL
-                    string reporteFinal = string.Format(
-                      "=========================================\n" +
-                      "   AUDITORÍA DE SEGURIDAD DE CIEDs (TG-203)   \n" +
-                      "=========================================\n" +
-                      "Dispositivo Detectado: {0}\n" +
-                      "Tipo de Volumen: {1}\n\n" +
-                      "1. ANÁLISIS DOSIMÉTRICO:\n" +
-                      " - Dosis Máxima (Dmax): {2:F3} Gy\n" +
-                      " - Dosis en Volumen (D5%): {3:F3} Gy\n\n" +
-                      "2. ANÁLISIS DE HAZ Y GEOMETRÍA:\n" +
-                      " - Energía Máxima: {4}\n" +
-                      " - Contaminación por Neutrones (>=10MV): {5}\n" +
-                      " - Distancia Mínima Estimada al Borde: {6:F1} cm\n\n" +
-                      "=========================================\n" +
-                      "   CATEGORÍA DE RIESGO: {7}\n" +
-                      "=========================================\n" +
-                      "Acción Recomendada:\n{8}",
-                      detectedCied.Id,
-                      detectedCied.DicomType,
-                      doseExtractor.DmaxGy,
-                      doseExtractor.D5PercentGy,
-                      beamAuditor.MaxEnergyName,
-                      beamAuditor.HasHighEnergyRisk ? "SÍ (Alto Riesgo)" : "No detectada (Seguro)",
-                      beamAuditor.MinDistanceToEdgeCm,
-                      riskEvaluator.RiskLevel.ToUpper(),
-                      riskEvaluator.Recommendation
+                    // REPORTE CLÍNICO CONSOLIDADO FINAL: ventana visual con semáforo por ítem
+                    // (en vez de texto plano) para que el umbral y el nivel de riesgo de cada
+                    // medición sean explícitos, no solo el veredicto final.
+                    CiedAuditReportWindow reportWindow = new CiedAuditReportWindow(
+                      detectedCied, doseExtractor, beamAuditor, riskEvaluator
                     );
-
-                    MessageBox.Show(reporteFinal, "Reporte de Auditoría Clínica - Final", MessageBoxButton.OK, MessageBoxImage.Information);
+                    reportWindow.ShowDialog();
                 }
             }
             catch (Exception ex)
@@ -353,42 +333,262 @@ namespace VMS.TPS
     // 5. CLASE AUXILIAR - FASE 4 (Motor Lógico de Riesgo)
     public class CiedRiskEvaluator
     {
+        // Umbrales según AAPM TG-203, centralizados aquí para que la clasificación global y los
+        // semáforos por ítem del reporte visual usen el mismo origen y no se desincronicen.
+        public const double DoseAltoRiesgoGy = 5.0;
+        public const double DoseModeradoMinGy = 2.0;
+        public const double DistanciaCriticaCm = 5.0;
+
         private readonly double _dmax;
         private readonly bool _hasNeutrons;
         private readonly double _distance;
 
         public string RiskLevel { get; private set; }
+        public string RiskLevelTier { get; private set; }
         public string Recommendation { get; private set; }
+
+        public string DoseRiskLevel { get; private set; }
+        public string EnergyRiskLevel { get; private set; }
+        public string DistanceRiskLevel { get; private set; }
 
         public CiedRiskEvaluator(double dmax, bool hasNeutrons, double distance)
         {
             _dmax = dmax;
             _hasNeutrons = hasNeutrons;
             _distance = distance;
-            RiskLevel = "Bajo";
+            RiskLevel = "Bajo Riesgo";
+            RiskLevelTier = "Bajo";
             Recommendation = "";
         }
 
         public void EvaluateRisk()
         {
-            // Regla de ALTO RIESGO según AAPM TG-203
-            if (_dmax > 5.0 || (_hasNeutrons && _distance < 5.0))
+            ClassifyDose();
+            ClassifyEnergyAndDistance();
+
+            // El veredicto global se deriva de los mismos niveles por ítem que se muestran en
+            // el reporte visual, en vez de re-evaluar los umbrales por separado.
+            if (DoseRiskLevel == "Alto" || EnergyRiskLevel == "Alto")
             {
+                RiskLevelTier = "Alto";
                 RiskLevel = "Alto Riesgo";
                 Recommendation = "- Requiere re-planificación inmediata si es físicamente posible.\n- Monitorización cardíaca continua por ECG durante cada fracción.\n- Interrogación del CIED antes de la primera sesión y al finalizar el tratamiento.";
             }
-            // Regla de RIESGO MODERADO
-            else if ((_dmax >= 2.0 && _dmax <= 5.0) || (_hasNeutrons && _distance >= 5.0) || (_distance > 0.0 && _distance < 5.0))
+            else if (DoseRiskLevel == "Moderado" || EnergyRiskLevel == "Moderado" || DistanceRiskLevel == "Moderado")
             {
+                RiskLevelTier = "Moderado";
                 RiskLevel = "Riesgo Moderado";
                 Recommendation = "- Verificar la dosis acumulada semanalmente.\n- Considerar reprogramación/interrogación del dispositivo a mitad del tratamiento.\n- Monitorización de signos vitales básicos en sala.";
             }
-            // Regla de BAJO RIESGO
             else
             {
+                RiskLevelTier = "Bajo";
                 RiskLevel = "Bajo Riesgo";
                 Recommendation = "- Nivel seguro. Proceder con el tratamiento estándar.\n- Realizar una interrogación de control post-radioterapia por protocolo.";
             }
+        }
+
+        private void ClassifyDose()
+        {
+            if (_dmax > DoseAltoRiesgoGy)
+            {
+                DoseRiskLevel = "Alto";
+            }
+            else if (_dmax >= DoseModeradoMinGy)
+            {
+                DoseRiskLevel = "Moderado";
+            }
+            else
+            {
+                DoseRiskLevel = "Bajo";
+            }
+        }
+
+        private void ClassifyEnergyAndDistance()
+        {
+            // La contaminación por neutrones solo es clínicamente relevante si el CIED está
+            // cerca del campo, así que energía y distancia se evalúan como una regla acoplada,
+            // igual que en la lógica original de este motor de riesgo.
+            bool distanciaMenorCritica = _distance < DistanciaCriticaCm;
+            bool distanciaEnRangoModeradoSinNeutrones = _distance > 0.0 && _distance < DistanciaCriticaCm;
+
+            if (_hasNeutrons && distanciaMenorCritica)
+            {
+                EnergyRiskLevel = "Alto";
+                DistanceRiskLevel = "Alto";
+            }
+            else if (_hasNeutrons)
+            {
+                EnergyRiskLevel = "Moderado";
+                DistanceRiskLevel = "Moderado";
+            }
+            else if (distanciaEnRangoModeradoSinNeutrones)
+            {
+                EnergyRiskLevel = "Bajo";
+                DistanceRiskLevel = "Moderado";
+            }
+            else
+            {
+                EnergyRiskLevel = "Bajo";
+                DistanceRiskLevel = "Bajo";
+            }
+        }
+    }
+
+    // 6. CLASE AUXILIAR - UI (Ventana de Reporte Visual con Semáforos)
+    public class CiedAuditReportWindow : Window
+    {
+        private static readonly Brush ColorAlto = new SolidColorBrush(Color.FromRgb(0xD9, 0x2D, 0x20));
+        private static readonly Brush ColorModerado = new SolidColorBrush(Color.FromRgb(0xE8, 0xA6, 0x0D));
+        private static readonly Brush ColorBajo = new SolidColorBrush(Color.FromRgb(0x2E, 0xA0, 0x4B));
+        private static readonly Brush ColorInformativo = new SolidColorBrush(Color.FromRgb(0x9E, 0x9E, 0x9E));
+
+        public CiedAuditReportWindow(
+          Structure detectedCied,
+          CiedDoseExtractor doseExtractor,
+          CiedBeamAuditor beamAuditor,
+          CiedRiskEvaluator riskEvaluator)
+        {
+            Title = "Reporte de Auditoría Clínica - Final";
+            SizeToContent = SizeToContent.WidthAndHeight;
+            ResizeMode = ResizeMode.NoResize;
+            WindowStartupLocation = WindowStartupLocation.CenterScreen;
+            MinWidth = 480;
+
+            StackPanel mainStack = new StackPanel { Margin = new Thickness(18) };
+
+            mainStack.Children.Add(new TextBlock
+            {
+                Text = "AUDITORÍA DE SEGURIDAD DE CIEDs (TG-203)",
+                FontWeight = FontWeights.Bold,
+                FontSize = 16,
+                Margin = new Thickness(0, 0, 0, 4)
+            });
+
+            mainStack.Children.Add(new TextBlock
+            {
+                Text = string.Format("Dispositivo Detectado: {0}    |    Tipo de Volumen: {1}", detectedCied.Id, detectedCied.DicomType),
+                Margin = new Thickness(0, 0, 0, 14)
+            });
+
+            mainStack.Children.Add(BuildItemRow(
+              "Dosis Máxima (Dmax)",
+              string.Format("{0:F3} Gy", doseExtractor.DmaxGy),
+              string.Format(
+                "Bajo < {0:F1} Gy   |   Moderado {0:F1}-{1:F1} Gy   |   Alto > {1:F1} Gy",
+                CiedRiskEvaluator.DoseModeradoMinGy,
+                CiedRiskEvaluator.DoseAltoRiesgoGy
+              ),
+              riskEvaluator.DoseRiskLevel
+            ));
+
+            mainStack.Children.Add(BuildItemRow(
+              "Dosis en Volumen (D5%)",
+              string.Format("{0:F3} Gy", doseExtractor.D5PercentGy),
+              "Valor informativo — no tiene un umbral de riesgo propio en este motor de evaluación.",
+              null
+            ));
+
+            mainStack.Children.Add(BuildItemRow(
+              "Energía / Contaminación por Neutrones (>=10MV)",
+              string.Format("{0}  ({1})", beamAuditor.MaxEnergyName, beamAuditor.HasHighEnergyRisk ? "detectada" : "no detectada"),
+              string.Format(
+                "Alto si hay neutrones y distancia < {0:F0}cm   |   Moderado si hay neutrones y distancia >= {0:F0}cm   |   Bajo si no hay neutrones",
+                CiedRiskEvaluator.DistanciaCriticaCm
+              ),
+              riskEvaluator.EnergyRiskLevel
+            ));
+
+            mainStack.Children.Add(BuildItemRow(
+              "Distancia Mínima Estimada al Borde",
+              string.Format("{0:F1} cm", beamAuditor.MinDistanceToEdgeCm),
+              string.Format(
+                "Alto si < {0:F0}cm con neutrones   |   Moderado si < {0:F0}cm sin neutrones, o >= {0:F0}cm con neutrones   |   Bajo si >= {0:F0}cm sin neutrones",
+                CiedRiskEvaluator.DistanciaCriticaCm
+              ),
+              riskEvaluator.DistanceRiskLevel
+            ));
+
+            mainStack.Children.Add(new Separator { Margin = new Thickness(0, 10, 0, 10) });
+
+            StackPanel overallPanel = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 10) };
+            overallPanel.Children.Add(CreateDot(riskEvaluator.RiskLevelTier, 22));
+            overallPanel.Children.Add(new TextBlock
+            {
+                Text = "  CATEGORÍA DE RIESGO: " + riskEvaluator.RiskLevel.ToUpper(),
+                FontWeight = FontWeights.Bold,
+                FontSize = 15,
+                VerticalAlignment = VerticalAlignment.Center
+            });
+            mainStack.Children.Add(overallPanel);
+
+            mainStack.Children.Add(new TextBlock { Text = "Acción Recomendada:", FontWeight = FontWeights.Bold, Margin = new Thickness(0, 0, 0, 2) });
+            mainStack.Children.Add(new TextBlock { Text = riskEvaluator.Recommendation, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 16) });
+
+            Button botonAceptar = new Button { Content = "Aceptar", Width = 100, Padding = new Thickness(4), HorizontalAlignment = HorizontalAlignment.Right };
+            botonAceptar.Click += (sender, args) => Close();
+            mainStack.Children.Add(botonAceptar);
+
+            Content = mainStack;
+        }
+
+        private UIElement BuildItemRow(string etiqueta, string valor, string textoUmbral, string nivel)
+        {
+            Grid grid = new Grid { Margin = new Thickness(0, 0, 0, 10) };
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(24) });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+            Ellipse dot = CreateDot(nivel, 14);
+            Grid.SetColumn(dot, 0);
+
+            StackPanel textPanel = new StackPanel();
+            textPanel.Children.Add(new TextBlock { Text = etiqueta, FontWeight = FontWeights.SemiBold });
+            textPanel.Children.Add(new TextBlock { Text = valor, FontSize = 13 });
+            textPanel.Children.Add(new TextBlock
+            {
+                Text = textoUmbral,
+                FontSize = 11,
+                Foreground = Brushes.Gray,
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 2, 0, 0)
+            });
+            Grid.SetColumn(textPanel, 1);
+
+            grid.Children.Add(dot);
+            grid.Children.Add(textPanel);
+            return grid;
+        }
+
+        // nivel: "Alto" / "Moderado" / "Bajo", o null para un ítem sin umbral de riesgo (gris).
+        private Ellipse CreateDot(string nivel, double tamano)
+        {
+            Brush color;
+
+            if (nivel == "Alto")
+            {
+                color = ColorAlto;
+            }
+            else if (nivel == "Moderado")
+            {
+                color = ColorModerado;
+            }
+            else if (nivel == "Bajo")
+            {
+                color = ColorBajo;
+            }
+            else
+            {
+                color = ColorInformativo;
+            }
+
+            return new Ellipse
+            {
+                Width = tamano,
+                Height = tamano,
+                Fill = color,
+                Margin = new Thickness(2, 4, 8, 0),
+                VerticalAlignment = VerticalAlignment.Top
+            };
         }
     }
 }
