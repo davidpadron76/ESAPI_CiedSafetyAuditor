@@ -61,7 +61,8 @@ namespace VMS.TPS
                     CiedRiskEvaluator riskEvaluator = new CiedRiskEvaluator(
                       doseExtractor.DmaxGy,
                       beamAuditor.HasHighEnergyRisk,
-                      beamAuditor.MinDistanceToEdgeCm
+                      beamAuditor.MinDistanceToEdgeCm,
+                      beamAuditor.HasGeometryData
                     );
                     riskEvaluator.EvaluateRisk();
 
@@ -450,6 +451,23 @@ namespace VMS.TPS
         public string MaxEnergyName { get; private set; }
         public double MinDistanceToEdgeCm { get; private set; }
 
+        // Falso si ningún haz de tratamiento aportó geometría evaluable. Permite distinguir
+        // "no se pudo medir" de "el dispositivo está dentro del campo", que son 0.0 cm ambos.
+        public bool HasGeometryData { get; private set; }
+
+        // Haz y ángulos del control point donde se alcanza la distancia mínima, para que el
+        // físico pueda ir directamente a esa geometría en Eclipse y verificarla.
+        public string MinDistanceBeamId { get; private set; }
+        public double MinDistanceGantryAngle { get; private set; }
+        public double MinDistanceCollimatorAngle { get; private set; }
+        public double MinDistanceCouchAngle { get; private set; }
+
+        // Cuántos control points dejan el dispositivo dentro del campo, sobre el total evaluado.
+        // Con distancia 0.0 el ángulo del mínimo no es único, así que el conteo dice si se trata
+        // de un instante puntual del arco o de una fracción sustancial del tratamiento.
+        public int InFieldControlPointCount { get; private set; }
+        public int EvaluatedControlPointCount { get; private set; }
+
         public CiedBeamAuditor(PlanSetup plan, Structure cied)
         {
             _plan = plan;
@@ -457,6 +475,8 @@ namespace VMS.TPS
             HasHighEnergyRisk = false;
             MaxEnergyName = "Desconocida";
             MinDistanceToEdgeCm = 999.0;
+            HasGeometryData = false;
+            MinDistanceBeamId = "";
         }
 
         public void AuditBeams()
@@ -486,11 +506,6 @@ namespace VMS.TPS
 
             BeamEyeViewProjector projector = new BeamEyeViewProjector(orientation);
             Point3DCollection meshPoints = _cied.MeshGeometry.Positions;
-
-            // Una vez que el CIED cae dentro del campo la distancia ya no puede bajar de cero, así
-            // que se deja de calcular geometría. El recorrido de haces continúa igualmente porque
-            // la energía máxima y la detección de neutrones sí dependen de todos los haces.
-            bool geometriaSaturada = false;
 
             foreach (Beam beam in _plan.Beams)
             {
@@ -525,10 +540,15 @@ namespace VMS.TPS
                     }
                 }
 
-                if (geometriaSaturada || beam.ControlPoints == null || beam.ControlPoints.Count == 0)
+                if (beam.ControlPoints == null || beam.ControlPoints.Count == 0)
                 {
                     continue;
                 }
+
+                // No se corta al llegar a 0.0 cm: recorrer el arco completo permite contar en
+                // cuántos control points el dispositivo queda dentro del campo, que distingue un
+                // instante puntual de una fracción sustancial del tratamiento. El coste es bajo
+                // porque MinDistanceOutsideFieldMm retorna en cuanto encuentra un vértice dentro.
 
                 // La conversión al sistema IEC sólo depende de la orientación y del isocentro, no
                 // del control point, así que se hace una vez por haz y se reutiliza en todos.
@@ -537,6 +557,8 @@ namespace VMS.TPS
                 // En VMAT el gantry (y las mordazas) cambian en cada control point, así que evaluar
                 // sólo el primero subestimaba groseramente el riesgo: basta con que un ángulo del
                 // arco apunte al CIED para que la distancia real sea cero.
+                HasGeometryData = true;
+
                 foreach (ControlPoint controlPoint in beam.ControlPoints)
                 {
                     double distanciaMm = projector.MinDistanceOutsideFieldMm(
@@ -548,21 +570,25 @@ namespace VMS.TPS
                     );
 
                     double distanciaCm = distanciaMm / 10.0;
+                    EvaluatedControlPointCount++;
+
+                    if (distanciaCm <= 0.0)
+                    {
+                        InFieldControlPointCount++;
+                    }
 
                     if (distanciaCm < MinDistanceToEdgeCm)
                     {
                         MinDistanceToEdgeCm = distanciaCm;
-                    }
-
-                    if (MinDistanceToEdgeCm <= 0.0)
-                    {
-                        geometriaSaturada = true;
-                        break;
+                        MinDistanceBeamId = beam.Id;
+                        MinDistanceGantryAngle = controlPoint.GantryAngle;
+                        MinDistanceCollimatorAngle = controlPoint.CollimatorAngle;
+                        MinDistanceCouchAngle = controlPoint.PatientSupportAngle;
                     }
                 }
             }
 
-            if (MinDistanceToEdgeCm == 999.0)
+            if (!HasGeometryData)
             {
                 MinDistanceToEdgeCm = 0.0;
             }
@@ -581,6 +607,7 @@ namespace VMS.TPS
         private readonly double _dmax;
         private readonly bool _hasNeutrons;
         private readonly double _distance;
+        private readonly bool _hasGeometryData;
 
         public string RiskLevel { get; private set; }
         public string RiskLevelTier { get; private set; }
@@ -590,11 +617,12 @@ namespace VMS.TPS
         public string EnergyRiskLevel { get; private set; }
         public string DistanceRiskLevel { get; private set; }
 
-        public CiedRiskEvaluator(double dmax, bool hasNeutrons, double distance)
+        public CiedRiskEvaluator(double dmax, bool hasNeutrons, double distance, bool hasGeometryData)
         {
             _dmax = dmax;
             _hasNeutrons = hasNeutrons;
             _distance = distance;
+            _hasGeometryData = hasGeometryData;
             RiskLevel = "Bajo Riesgo";
             RiskLevelTier = "Bajo";
             Recommendation = "";
@@ -645,13 +673,27 @@ namespace VMS.TPS
 
         private void ClassifyEnergyAndDistance()
         {
+            if (!_hasGeometryData)
+            {
+                // Sin haces de tratamiento con control points no hay geometría que clasificar.
+                // Se deja la distancia sin nivel (punto gris) en lugar de inventar un 0.0 que
+                // el clasificador leería como un dato real.
+                EnergyRiskLevel = _hasNeutrons ? "Moderado" : "Bajo";
+                DistanceRiskLevel = null;
+                return;
+            }
+
+            // Una distancia de 0.0 cm significa que el dispositivo queda dentro del campo en algún
+            // ángulo: es el caso extremo de "distancia por debajo del umbral crítico", no un caso
+            // seguro. Antes quedaba excluido por un guard `distancia > 0` heredado de cuando 0.0
+            // sólo señalaba ausencia de datos, lo que hacía que un CIED dentro del campo se
+            // reportara en verde.
+            bool distanciaBajoUmbral = _distance < DistanciaCriticaCm;
+
             // La contaminación por neutrones solo es clínicamente relevante si el CIED está
             // cerca del campo, así que energía y distancia se evalúan como una regla acoplada,
             // igual que en la lógica original de este motor de riesgo.
-            bool distanciaMenorCritica = _distance < DistanciaCriticaCm;
-            bool distanciaEnRangoModeradoSinNeutrones = _distance > 0.0 && _distance < DistanciaCriticaCm;
-
-            if (_hasNeutrons && distanciaMenorCritica)
+            if (_hasNeutrons && distanciaBajoUmbral)
             {
                 EnergyRiskLevel = "Alto";
                 DistanceRiskLevel = "Alto";
@@ -661,7 +703,7 @@ namespace VMS.TPS
                 EnergyRiskLevel = "Moderado";
                 DistanceRiskLevel = "Moderado";
             }
-            else if (distanciaEnRangoModeradoSinNeutrones)
+            else if (distanciaBajoUmbral)
             {
                 EnergyRiskLevel = "Bajo";
                 DistanceRiskLevel = "Moderado";
@@ -738,9 +780,40 @@ namespace VMS.TPS
               riskEvaluator.EnergyRiskLevel
             ));
 
+            string distanciaValor;
+
+            if (!beamAuditor.HasGeometryData)
+            {
+                distanciaValor = "Sin datos — ningún haz de tratamiento con geometría evaluable";
+            }
+            else if (beamAuditor.MinDistanceToEdgeCm <= 0.0)
+            {
+                distanciaValor = string.Format(
+                  "0.0 cm — DENTRO del campo (mordazas) en {0} de {1} control points\n" +
+                  "Primera entrada: {2}, gantry {3:F1}° / colimador {4:F1}° / camilla {5:F1}°",
+                  beamAuditor.InFieldControlPointCount,
+                  beamAuditor.EvaluatedControlPointCount,
+                  beamAuditor.MinDistanceBeamId,
+                  beamAuditor.MinDistanceGantryAngle,
+                  beamAuditor.MinDistanceCollimatorAngle,
+                  beamAuditor.MinDistanceCouchAngle
+                );
+            }
+            else
+            {
+                distanciaValor = string.Format(
+                  "{0:F1} cm\nMínimo en: {1}, gantry {2:F1}° / colimador {3:F1}° / camilla {4:F1}°",
+                  beamAuditor.MinDistanceToEdgeCm,
+                  beamAuditor.MinDistanceBeamId,
+                  beamAuditor.MinDistanceGantryAngle,
+                  beamAuditor.MinDistanceCollimatorAngle,
+                  beamAuditor.MinDistanceCouchAngle
+                );
+            }
+
             mainStack.Children.Add(BuildItemRow(
               "Distancia Mínima al Borde de Campo (BEV, todos los ángulos)",
-              string.Format("{0:F1} cm", beamAuditor.MinDistanceToEdgeCm),
+              distanciaValor,
               string.Format(
                 "Alto si < {0:F0}cm con neutrones   |   Moderado si < {0:F0}cm sin neutrones, o >= {0:F0}cm con neutrones   |   Bajo si >= {0:F0}cm sin neutrones",
                 CiedRiskEvaluator.DistanciaCriticaCm
@@ -782,7 +855,7 @@ namespace VMS.TPS
 
             StackPanel textPanel = new StackPanel();
             textPanel.Children.Add(new TextBlock { Text = etiqueta, FontWeight = FontWeights.SemiBold });
-            textPanel.Children.Add(new TextBlock { Text = valor, FontSize = 13 });
+            textPanel.Children.Add(new TextBlock { Text = valor, FontSize = 13, TextWrapping = TextWrapping.Wrap });
             textPanel.Children.Add(new TextBlock
             {
                 Text = textoUmbral,
