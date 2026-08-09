@@ -61,7 +61,8 @@ namespace VMS.TPS
                     CiedRiskEvaluator riskEvaluator = new CiedRiskEvaluator(
                       doseExtractor.DmaxGy,
                       beamAuditor.HasHighEnergyRisk,
-                      beamAuditor.MinDistanceToEdgeCm
+                      beamAuditor.MinDistanceToEdgeCm,
+                      beamAuditor.HasGeometryData
                     );
                     riskEvaluator.EvaluateRisk();
 
@@ -258,7 +259,70 @@ namespace VMS.TPS
         }
     }
 
-    // 4a. CLASE AUXILIAR - Proyección Beam's-Eye-View (IEC 61217)
+    // 4a. CLASE AUXILIAR - Geometría de láminas del MLC
+    //
+    // ESAPI expone las posiciones de las láminas (ControlPoint.LeafPositions) pero no las fronteras
+    // en Y de cada par, que dependen del modelo físico de MLC. Se derivan del identificador del
+    // dispositivo contra una tabla de modelos Varian conocidos. Un modelo no reconocido devuelve
+    // null y el auditor cae a evaluación por mordazas, en lugar de asumir una geometría inventada.
+    public static class MlcGeometry
+    {
+        // Fronteras en Y (mm en el plano del isocentro), ordenadas de Y1 (negativo) a Y2 (positivo).
+        // N pares de láminas producen N+1 fronteras.
+        public static double[] GetLeafBoundaries(string mlcId)
+        {
+            if (string.IsNullOrEmpty(mlcId))
+            {
+                return null;
+            }
+
+            string id = mlcId.ToUpperInvariant();
+
+            // El HD120 también contiene "120" en su nombre, así que se evalúa primero.
+            if (id.Contains("HD") || id.Contains("HIGH DEFINITION"))
+            {
+                return BuildBoundaries(-110.0, new[] { 14, 32, 14 }, new[] { 5.0, 2.5, 5.0 });
+            }
+
+            if (id.Contains("120"))
+            {
+                return BuildBoundaries(-200.0, new[] { 10, 40, 10 }, new[] { 10.0, 5.0, 10.0 });
+            }
+
+            if (id.Contains("80"))
+            {
+                return BuildBoundaries(-200.0, new[] { 40 }, new[] { 10.0 });
+            }
+
+            return null;
+        }
+
+        private static double[] BuildBoundaries(double start, int[] counts, double[] widths)
+        {
+            int total = 1;
+            for (int i = 0; i < counts.Length; i++)
+            {
+                total += counts[i];
+            }
+
+            double[] boundaries = new double[total];
+            boundaries[0] = start;
+
+            int index = 1;
+            for (int seccion = 0; seccion < counts.Length; seccion++)
+            {
+                for (int i = 0; i < counts[seccion]; i++)
+                {
+                    boundaries[index] = boundaries[index - 1] + widths[seccion];
+                    index++;
+                }
+            }
+
+            return boundaries;
+        }
+    }
+
+    // 4b. CLASE AUXILIAR - Proyección Beam's-Eye-View (IEC 61217)
     //
     // Proyecta puntos del paciente al sistema de coordenadas del haz para medir la distancia real
     // al borde del campo, considerando gantry, colimador y camilla. Reemplaza la heurística previa
@@ -334,16 +398,27 @@ namespace VMS.TPS
             return resultado;
         }
 
-        // Distancia mínima (mm) desde cualquier vértice del CIED hasta el borde del campo, medida
-        // en el plano perpendicular al haz que pasa por ese vértice. Devuelve 0.0 si algún vértice
-        // cae dentro del campo. Se evalúa para un único control point (un ángulo de gantry).
+        // Distancia mínima (mm) desde cualquier vértice del CIED hasta el borde de la apertura,
+        // medida en el plano perpendicular al haz que pasa por ese vértice. Devuelve 0.0 si algún
+        // vértice cae dentro de la apertura. Se evalúa para un único control point.
+        //
+        // Si se entregan posiciones y fronteras de láminas, la apertura es la conformada por el
+        // MLC recortada por las mordazas; si no, es el rectángulo de mordazas solamente.
         public double MinDistanceOutsideFieldMm(
           double[] iecPoints,
           double gantryDeg,
           double collimatorDeg,
           double couchDeg,
-          VRect<double> jaws)
+          VRect<double> jaws,
+          float[,] leafPositions,
+          double[] leafBoundaries)
         {
+            bool usarMlc = leafPositions != null
+                        && leafBoundaries != null
+                        && leafBoundaries.Length >= 2
+                        && leafPositions.GetLength(0) == 2
+                        && leafPositions.GetLength(1) == leafBoundaries.Length - 1;
+
             // Base del haz en el sistema fijo IEC para el ángulo de gantry dado.
             // Gantry 0 = fuente arriba, haz hacia abajo (-Zf). Gantry 90 = fuente del lado +Xf
             // (izquierda del paciente en HFS), haz viajando hacia -Xf. Coincide con la escala IEC
@@ -423,20 +498,124 @@ namespace VMS.TPS
                 if (inpl < yMin * divergencia) outInpl = yMin * divergencia - inpl;
                 else if (inpl > yMax * divergencia) outInpl = inpl - yMax * divergencia;
 
-                if (outCross <= 0.0 && outInpl <= 0.0)
+                double distanciaMordazas = Math.Sqrt(outCross * outCross + outInpl * outInpl);
+
+                if (!usarMlc)
                 {
-                    // Vértice dentro del campo: no puede haber una distancia menor que cero.
+                    if (distanciaMordazas <= 0.0)
+                    {
+                        return 0.0;
+                    }
+
+                    if (distanciaMordazas < minDistancia)
+                    {
+                        minDistancia = distanciaMordazas;
+                    }
+
+                    continue;
+                }
+
+                // La apertura del MLC está contenida en el rectángulo de mordazas, así que la
+                // distancia al MLC nunca puede ser menor que la distancia a las mordazas. Si esta
+                // última ya no mejora el mínimo acumulado, el cálculo por láminas es innecesario.
+                if (distanciaMordazas >= minDistancia)
+                {
+                    continue;
+                }
+
+                double distanciaApertura = DistanceToMlcApertureMm(
+                  cross, inpl, divergencia, xMin, xMax, yMin, yMax,
+                  leafPositions, leafBoundaries, minDistancia
+                );
+
+                if (distanciaApertura <= 0.0)
+                {
                     return 0.0;
                 }
 
-                double distancia = Math.Sqrt(outCross * outCross + outInpl * outInpl);
-                if (distancia < minDistancia)
+                if (distanciaApertura < minDistancia)
                 {
-                    minDistancia = distancia;
+                    minDistancia = distanciaApertura;
                 }
             }
 
             return minDistancia == double.MaxValue ? 0.0 : minDistancia;
+        }
+
+        // La apertura conformada por el MLC es la unión de un rectángulo por par de láminas
+        // (el hueco entre las dos láminas, limitado en Y por las fronteras del par y recortado por
+        // las mordazas). La distancia a una unión es el mínimo de las distancias, así que basta
+        // recorrer los pares. Los pares cerrados o completamente tapados por mordazas no aportan.
+        private static double DistanceToMlcApertureMm(
+          double cross,
+          double inpl,
+          double divergencia,
+          double xMin,
+          double xMax,
+          double yMin,
+          double yMax,
+          float[,] leafPositions,
+          double[] leafBoundaries,
+          double mejorConocida)
+        {
+            double jawXMin = xMin * divergencia;
+            double jawXMax = xMax * divergencia;
+            double jawYMin = yMin * divergencia;
+            double jawYMax = yMax * divergencia;
+
+            double mejor = mejorConocida;
+            int totalPares = leafBoundaries.Length - 1;
+
+            for (int par = 0; par < totalPares; par++)
+            {
+                double rectYMin = Math.Max(leafBoundaries[par] * divergencia, jawYMin);
+                double rectYMax = Math.Min(leafBoundaries[par + 1] * divergencia, jawYMax);
+
+                if (rectYMax <= rectYMin)
+                {
+                    // Par completamente fuera de la apertura de mordazas.
+                    continue;
+                }
+
+                // Poda: la distancia sólo en Y ya acota por debajo la distancia al rectángulo, así
+                // que un par demasiado alejado en Y no puede mejorar el mínimo.
+                double distY = 0.0;
+                if (inpl < rectYMin) distY = rectYMin - inpl;
+                else if (inpl > rectYMax) distY = inpl - rectYMax;
+
+                if (distY >= mejor)
+                {
+                    continue;
+                }
+
+                // Banco 0 = lado X1 (negativo), banco 1 = lado X2 (positivo).
+                double rectXMin = Math.Max(leafPositions[0, par] * divergencia, jawXMin);
+                double rectXMax = Math.Min(leafPositions[1, par] * divergencia, jawXMax);
+
+                if (rectXMax <= rectXMin)
+                {
+                    // Par de láminas cerrado, o su hueco queda fuera de las mordazas.
+                    continue;
+                }
+
+                double distX = 0.0;
+                if (cross < rectXMin) distX = rectXMin - cross;
+                else if (cross > rectXMax) distX = cross - rectXMax;
+
+                double distancia = Math.Sqrt(distX * distX + distY * distY);
+
+                if (distancia <= 0.0)
+                {
+                    return 0.0;
+                }
+
+                if (distancia < mejor)
+                {
+                    mejor = distancia;
+                }
+            }
+
+            return mejor;
         }
     }
 
@@ -450,6 +629,27 @@ namespace VMS.TPS
         public string MaxEnergyName { get; private set; }
         public double MinDistanceToEdgeCm { get; private set; }
 
+        // Falso si ningún haz de tratamiento aportó geometría evaluable. Permite distinguir
+        // "no se pudo medir" de "el dispositivo está dentro del campo", que son 0.0 cm ambos.
+        public bool HasGeometryData { get; private set; }
+
+        // Haz y ángulos del control point donde se alcanza la distancia mínima, para que el
+        // físico pueda ir directamente a esa geometría en Eclipse y verificarla.
+        public string MinDistanceBeamId { get; private set; }
+        public double MinDistanceGantryAngle { get; private set; }
+        public double MinDistanceCollimatorAngle { get; private set; }
+        public double MinDistanceCouchAngle { get; private set; }
+
+        // Cuántos control points dejan el dispositivo dentro del campo, sobre el total evaluado.
+        // Con distancia 0.0 el ángulo del mínimo no es único, así que el conteo dice si se trata
+        // de un instante puntual del arco o de una fracción sustancial del tratamiento.
+        public int InFieldControlPointCount { get; private set; }
+        public int EvaluatedControlPointCount { get; private set; }
+
+        // Describe con qué nivel de detalle se calculó la geometría, para que el reporte no
+        // presente un resultado por mordazas como si hubiese considerado el bloqueo del MLC.
+        public string ApertureModelDescription { get; private set; }
+
         public CiedBeamAuditor(PlanSetup plan, Structure cied)
         {
             _plan = plan;
@@ -457,6 +657,9 @@ namespace VMS.TPS
             HasHighEnergyRisk = false;
             MaxEnergyName = "Desconocida";
             MinDistanceToEdgeCm = 999.0;
+            HasGeometryData = false;
+            MinDistanceBeamId = "";
+            ApertureModelDescription = "";
         }
 
         public void AuditBeams()
@@ -486,11 +689,6 @@ namespace VMS.TPS
 
             BeamEyeViewProjector projector = new BeamEyeViewProjector(orientation);
             Point3DCollection meshPoints = _cied.MeshGeometry.Positions;
-
-            // Una vez que el CIED cae dentro del campo la distancia ya no puede bajar de cero, así
-            // que se deja de calcular geometría. El recorrido de haces continúa igualmente porque
-            // la energía máxima y la detección de neutrones sí dependen de todos los haces.
-            bool geometriaSaturada = false;
 
             foreach (Beam beam in _plan.Beams)
             {
@@ -525,18 +723,30 @@ namespace VMS.TPS
                     }
                 }
 
-                if (geometriaSaturada || beam.ControlPoints == null || beam.ControlPoints.Count == 0)
+                if (beam.ControlPoints == null || beam.ControlPoints.Count == 0)
                 {
                     continue;
                 }
+
+                // No se corta al llegar a 0.0 cm: recorrer el arco completo permite contar en
+                // cuántos control points el dispositivo queda dentro del campo, que distingue un
+                // instante puntual de una fracción sustancial del tratamiento. El coste es bajo
+                // porque MinDistanceOutsideFieldMm retorna en cuanto encuentra un vértice dentro.
 
                 // La conversión al sistema IEC sólo depende de la orientación y del isocentro, no
                 // del control point, así que se hace una vez por haz y se reutiliza en todos.
                 double[] iecPoints = projector.ToIecFixedRelative(meshPoints, beam.IsocenterPosition);
 
+                // Las fronteras de las láminas dependen del modelo de MLC, no del control point.
+                string mlcId = beam.MLC != null ? beam.MLC.Id : null;
+                double[] leafBoundaries = MlcGeometry.GetLeafBoundaries(mlcId);
+                RecordApertureModel(mlcId, leafBoundaries);
+
                 // En VMAT el gantry (y las mordazas) cambian en cada control point, así que evaluar
                 // sólo el primero subestimaba groseramente el riesgo: basta con que un ángulo del
                 // arco apunte al CIED para que la distancia real sea cero.
+                HasGeometryData = true;
+
                 foreach (ControlPoint controlPoint in beam.ControlPoints)
                 {
                     double distanciaMm = projector.MinDistanceOutsideFieldMm(
@@ -544,27 +754,64 @@ namespace VMS.TPS
                       controlPoint.GantryAngle,
                       controlPoint.CollimatorAngle,
                       controlPoint.PatientSupportAngle,
-                      controlPoint.JawPositions
+                      controlPoint.JawPositions,
+                      leafBoundaries != null ? controlPoint.LeafPositions : null,
+                      leafBoundaries
                     );
 
                     double distanciaCm = distanciaMm / 10.0;
+                    EvaluatedControlPointCount++;
+
+                    if (distanciaCm <= 0.0)
+                    {
+                        InFieldControlPointCount++;
+                    }
 
                     if (distanciaCm < MinDistanceToEdgeCm)
                     {
                         MinDistanceToEdgeCm = distanciaCm;
-                    }
-
-                    if (MinDistanceToEdgeCm <= 0.0)
-                    {
-                        geometriaSaturada = true;
-                        break;
+                        MinDistanceBeamId = beam.Id;
+                        MinDistanceGantryAngle = controlPoint.GantryAngle;
+                        MinDistanceCollimatorAngle = controlPoint.CollimatorAngle;
+                        MinDistanceCouchAngle = controlPoint.PatientSupportAngle;
                     }
                 }
             }
 
-            if (MinDistanceToEdgeCm == 999.0)
+            if (!HasGeometryData)
             {
                 MinDistanceToEdgeCm = 0.0;
+            }
+        }
+
+        // Deja constancia del modelo de apertura efectivamente usado. Si distintos haces usan
+        // distintos MLC (poco habitual pero posible en un plan mixto), prevalece la descripción
+        // menos precisa: el reporte debe reflejar el eslabón más débil del cálculo.
+        private void RecordApertureModel(string mlcId, double[] leafBoundaries)
+        {
+            string descripcion;
+
+            if (leafBoundaries != null)
+            {
+                descripcion = string.Format("mordazas + MLC ({0}, {1} pares de láminas)", mlcId, leafBoundaries.Length - 1);
+            }
+            else if (string.IsNullOrEmpty(mlcId))
+            {
+                descripcion = "sólo mordazas (el haz no declara MLC)";
+            }
+            else
+            {
+                descripcion = string.Format(
+                  "sólo mordazas — modelo de MLC '{0}' no reconocido, el bloqueo por láminas NO fue evaluado",
+                  mlcId
+                );
+            }
+
+            bool yaEsDegradado = ApertureModelDescription.StartsWith("sólo mordazas");
+
+            if (ApertureModelDescription.Length == 0 || (!yaEsDegradado && leafBoundaries == null))
+            {
+                ApertureModelDescription = descripcion;
             }
         }
     }
@@ -581,6 +828,7 @@ namespace VMS.TPS
         private readonly double _dmax;
         private readonly bool _hasNeutrons;
         private readonly double _distance;
+        private readonly bool _hasGeometryData;
 
         public string RiskLevel { get; private set; }
         public string RiskLevelTier { get; private set; }
@@ -590,11 +838,12 @@ namespace VMS.TPS
         public string EnergyRiskLevel { get; private set; }
         public string DistanceRiskLevel { get; private set; }
 
-        public CiedRiskEvaluator(double dmax, bool hasNeutrons, double distance)
+        public CiedRiskEvaluator(double dmax, bool hasNeutrons, double distance, bool hasGeometryData)
         {
             _dmax = dmax;
             _hasNeutrons = hasNeutrons;
             _distance = distance;
+            _hasGeometryData = hasGeometryData;
             RiskLevel = "Bajo Riesgo";
             RiskLevelTier = "Bajo";
             Recommendation = "";
@@ -645,13 +894,27 @@ namespace VMS.TPS
 
         private void ClassifyEnergyAndDistance()
         {
+            if (!_hasGeometryData)
+            {
+                // Sin haces de tratamiento con control points no hay geometría que clasificar.
+                // Se deja la distancia sin nivel (punto gris) en lugar de inventar un 0.0 que
+                // el clasificador leería como un dato real.
+                EnergyRiskLevel = _hasNeutrons ? "Moderado" : "Bajo";
+                DistanceRiskLevel = null;
+                return;
+            }
+
+            // Una distancia de 0.0 cm significa que el dispositivo queda dentro del campo en algún
+            // ángulo: es el caso extremo de "distancia por debajo del umbral crítico", no un caso
+            // seguro. Antes quedaba excluido por un guard `distancia > 0` heredado de cuando 0.0
+            // sólo señalaba ausencia de datos, lo que hacía que un CIED dentro del campo se
+            // reportara en verde.
+            bool distanciaBajoUmbral = _distance < DistanciaCriticaCm;
+
             // La contaminación por neutrones solo es clínicamente relevante si el CIED está
             // cerca del campo, así que energía y distancia se evalúan como una regla acoplada,
             // igual que en la lógica original de este motor de riesgo.
-            bool distanciaMenorCritica = _distance < DistanciaCriticaCm;
-            bool distanciaEnRangoModeradoSinNeutrones = _distance > 0.0 && _distance < DistanciaCriticaCm;
-
-            if (_hasNeutrons && distanciaMenorCritica)
+            if (_hasNeutrons && distanciaBajoUmbral)
             {
                 EnergyRiskLevel = "Alto";
                 DistanceRiskLevel = "Alto";
@@ -661,7 +924,7 @@ namespace VMS.TPS
                 EnergyRiskLevel = "Moderado";
                 DistanceRiskLevel = "Moderado";
             }
-            else if (distanciaEnRangoModeradoSinNeutrones)
+            else if (distanciaBajoUmbral)
             {
                 EnergyRiskLevel = "Bajo";
                 DistanceRiskLevel = "Moderado";
@@ -738,13 +1001,51 @@ namespace VMS.TPS
               riskEvaluator.EnergyRiskLevel
             ));
 
+            string distanciaValor;
+
+            if (!beamAuditor.HasGeometryData)
+            {
+                distanciaValor = "Sin datos — ningún haz de tratamiento con geometría evaluable";
+            }
+            else if (beamAuditor.MinDistanceToEdgeCm <= 0.0)
+            {
+                distanciaValor = string.Format(
+                  "0.0 cm — DENTRO de la apertura en {0} de {1} control points\n" +
+                  "Primera entrada: {2}, gantry {3:F1}° / colimador {4:F1}° / camilla {5:F1}°",
+                  beamAuditor.InFieldControlPointCount,
+                  beamAuditor.EvaluatedControlPointCount,
+                  beamAuditor.MinDistanceBeamId,
+                  beamAuditor.MinDistanceGantryAngle,
+                  beamAuditor.MinDistanceCollimatorAngle,
+                  beamAuditor.MinDistanceCouchAngle
+                );
+            }
+            else
+            {
+                distanciaValor = string.Format(
+                  "{0:F1} cm\nMínimo en: {1}, gantry {2:F1}° / colimador {3:F1}° / camilla {4:F1}°",
+                  beamAuditor.MinDistanceToEdgeCm,
+                  beamAuditor.MinDistanceBeamId,
+                  beamAuditor.MinDistanceGantryAngle,
+                  beamAuditor.MinDistanceCollimatorAngle,
+                  beamAuditor.MinDistanceCouchAngle
+                );
+            }
+
+            string umbralDistancia = string.Format(
+              "Alto si < {0:F0}cm con neutrones   |   Moderado si < {0:F0}cm sin neutrones, o >= {0:F0}cm con neutrones   |   Bajo si >= {0:F0}cm sin neutrones",
+              CiedRiskEvaluator.DistanciaCriticaCm
+            );
+
+            if (beamAuditor.HasGeometryData)
+            {
+                umbralDistancia += "\nApertura evaluada: " + beamAuditor.ApertureModelDescription;
+            }
+
             mainStack.Children.Add(BuildItemRow(
               "Distancia Mínima al Borde de Campo (BEV, todos los ángulos)",
-              string.Format("{0:F1} cm", beamAuditor.MinDistanceToEdgeCm),
-              string.Format(
-                "Alto si < {0:F0}cm con neutrones   |   Moderado si < {0:F0}cm sin neutrones, o >= {0:F0}cm con neutrones   |   Bajo si >= {0:F0}cm sin neutrones",
-                CiedRiskEvaluator.DistanciaCriticaCm
-              ),
+              distanciaValor,
+              umbralDistancia,
               riskEvaluator.DistanceRiskLevel
             ));
 
@@ -782,7 +1083,7 @@ namespace VMS.TPS
 
             StackPanel textPanel = new StackPanel();
             textPanel.Children.Add(new TextBlock { Text = etiqueta, FontWeight = FontWeights.SemiBold });
-            textPanel.Children.Add(new TextBlock { Text = valor, FontSize = 13 });
+            textPanel.Children.Add(new TextBlock { Text = valor, FontSize = 13, TextWrapping = TextWrapping.Wrap });
             textPanel.Children.Add(new TextBlock
             {
                 Text = textoUmbral,
