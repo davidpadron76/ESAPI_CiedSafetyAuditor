@@ -1,6 +1,9 @@
 using System;
+using System.IO;
 using System.Linq;
 using System.Text;
+using System.Globalization;
+using Microsoft.Win32;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
@@ -398,6 +401,66 @@ namespace VMS.TPS
             return resultado;
         }
 
+        // Proyecta un único punto (ya en coordenadas IEC relativas al isocentro) al sistema del haz.
+        // Se usa sólo por el volcado de validación, para poder contrastar la transformación contra
+        // las coordenadas que muestra Eclipse en la vista BEV.
+        public void ProjectSinglePoint(
+          double xf, double yf, double zf,
+          double gantryDeg, double collimatorDeg, double couchDeg,
+          out double cross, out double inpl, out double depth, out double divergencia)
+        {
+            double gRad = gantryDeg * Math.PI / 180.0;
+            double cosG = Math.Cos(gRad);
+            double sinG = Math.Sin(gRad);
+
+            double dirX = -sinG, dirZ = -cosG;
+            double crossX = cosG, crossZ = -sinG;
+
+            double cRad = collimatorDeg * Math.PI / 180.0;
+            double cosC = Math.Cos(cRad);
+            double sinC = Math.Sin(cRad);
+
+            double cx = crossX * cosC;
+            double cy = sinC;
+            double cz = crossZ * cosC;
+            double ix = -crossX * sinC;
+            double iy = cosC;
+            double iz = -crossZ * sinC;
+
+            double pRad = couchDeg * Math.PI / 180.0;
+            double cosP = Math.Cos(pRad);
+            double sinP = Math.Sin(pRad);
+
+            double xr = xf * cosP - yf * sinP;
+            double yr = xf * sinP + yf * cosP;
+            double zr = zf;
+
+            depth = xr * dirX + zr * dirZ;
+            cross = xr * cx + yr * cy + zr * cz;
+            inpl = xr * ix + yr * iy + zr * iz;
+            divergencia = (SourceAxisDistanceMm + depth) / SourceAxisDistanceMm;
+        }
+
+        // Índice del par de láminas cuyo intervalo en Y contiene la coordenada dada, o -1 si queda
+        // fuera del alcance del MLC. Las fronteras se comparan en el plano del isocentro.
+        public static int FindLeafPairIndex(double inpl, double divergencia, double[] leafBoundaries)
+        {
+            if (leafBoundaries == null || divergencia <= 0.0)
+            {
+                return -1;
+            }
+
+            for (int par = 0; par < leafBoundaries.Length - 1; par++)
+            {
+                if (inpl >= leafBoundaries[par] * divergencia && inpl < leafBoundaries[par + 1] * divergencia)
+                {
+                    return par;
+                }
+            }
+
+            return -1;
+        }
+
         // Distancia mínima (mm) desde cualquier vértice del CIED hasta el borde de la apertura,
         // medida en el plano perpendicular al haz que pasa por ese vértice. Devuelve 0.0 si algún
         // vértice cae dentro de la apertura. Se evalúa para un único control point.
@@ -650,6 +713,12 @@ namespace VMS.TPS
         // presente un resultado por mordazas como si hubiese considerado el bloqueo del MLC.
         public string ApertureModelDescription { get; private set; }
 
+        // Una fila por control point con los valores intermedios de la transformación, para
+        // contrastar el cálculo contra la vista BEV de Eclipse durante la validación. El coste es
+        // una proyección de punto extra por control point, despreciable frente al recorrido de
+        // vértices, así que se recolecta siempre y el reporte ofrece exportarla.
+        public List<string> ValidationRows { get; private set; }
+
         public CiedBeamAuditor(PlanSetup plan, Structure cied)
         {
             _plan = plan;
@@ -660,7 +729,15 @@ namespace VMS.TPS
             HasGeometryData = false;
             MinDistanceBeamId = "";
             ApertureModelDescription = "";
+            ValidationRows = new List<string>();
         }
+
+        public const string ValidationHeader =
+          "Haz\tCP\tGantry\tColim\tCamilla\t" +
+          "CentroCross_mm\tCentroInpl_mm\tCentroDepth_mm\tDivergencia\t" +
+          "JawX1_mm\tJawX2_mm\tJawY1_mm\tJawY2_mm\t" +
+          "ParLamina\tLaminaA_mm\tLaminaB_mm\t" +
+          "DistMin_cm\tDentroApertura";
 
         public void AuditBeams()
         {
@@ -742,6 +819,19 @@ namespace VMS.TPS
                 double[] leafBoundaries = MlcGeometry.GetLeafBoundaries(mlcId);
                 RecordApertureModel(mlcId, leafBoundaries);
 
+                // Punto de referencia para el volcado: el centro de la caja envolvente del CIED,
+                // convertido a IEC igual que el resto de los vértices.
+                var boundsCied = _cied.MeshGeometry.Bounds;
+                Point3DCollection centro = new Point3DCollection();
+                centro.Add(new Point3D(
+                  boundsCied.X + boundsCied.SizeX / 2.0,
+                  boundsCied.Y + boundsCied.SizeY / 2.0,
+                  boundsCied.Z + boundsCied.SizeZ / 2.0
+                ));
+                double[] centroIec = projector.ToIecFixedRelative(centro, beam.IsocenterPosition);
+
+                int indiceControlPoint = 0;
+
                 // En VMAT el gantry (y las mordazas) cambian en cada control point, así que evaluar
                 // sólo el primero subestimaba groseramente el riesgo: basta con que un ángulo del
                 // arco apunte al CIED para que la distancia real sea cero.
@@ -767,6 +857,12 @@ namespace VMS.TPS
                         InFieldControlPointCount++;
                     }
 
+                    AppendValidationRow(
+                      projector, beam.Id, indiceControlPoint, controlPoint,
+                      centroIec, leafBoundaries, distanciaCm
+                    );
+                    indiceControlPoint++;
+
                     if (distanciaCm < MinDistanceToEdgeCm)
                     {
                         MinDistanceToEdgeCm = distanciaCm;
@@ -782,6 +878,63 @@ namespace VMS.TPS
             {
                 MinDistanceToEdgeCm = 0.0;
             }
+        }
+
+        // Arma una fila del volcado de validación. Se usa cultura invariante y separador de
+        // tabulación para que los decimales no cambien de significado según la configuración
+        // regional de la estación al abrir el archivo en Excel.
+        private void AppendValidationRow(
+          BeamEyeViewProjector projector,
+          string beamId,
+          int indiceControlPoint,
+          ControlPoint controlPoint,
+          double[] centroIec,
+          double[] leafBoundaries,
+          double distanciaCm)
+        {
+            double cross, inpl, depth, divergencia;
+
+            projector.ProjectSinglePoint(
+              centroIec[0], centroIec[1], centroIec[2],
+              controlPoint.GantryAngle, controlPoint.CollimatorAngle, controlPoint.PatientSupportAngle,
+              out cross, out inpl, out depth, out divergencia
+            );
+
+            VRect<double> jaws = controlPoint.JawPositions;
+
+            int par = BeamEyeViewProjector.FindLeafPairIndex(inpl, divergencia, leafBoundaries);
+            string parTexto = "n/d";
+            string laminaA = "n/d";
+            string laminaB = "n/d";
+
+            if (par >= 0 && controlPoint.LeafPositions != null && par < controlPoint.LeafPositions.GetLength(1))
+            {
+                parTexto = par.ToString(CultureInfo.InvariantCulture);
+                laminaA = controlPoint.LeafPositions[0, par].ToString("F2", CultureInfo.InvariantCulture);
+                laminaB = controlPoint.LeafPositions[1, par].ToString("F2", CultureInfo.InvariantCulture);
+            }
+
+            ValidationRows.Add(string.Join("\t", new[]
+            {
+                beamId,
+                indiceControlPoint.ToString(CultureInfo.InvariantCulture),
+                controlPoint.GantryAngle.ToString("F2", CultureInfo.InvariantCulture),
+                controlPoint.CollimatorAngle.ToString("F2", CultureInfo.InvariantCulture),
+                controlPoint.PatientSupportAngle.ToString("F2", CultureInfo.InvariantCulture),
+                cross.ToString("F2", CultureInfo.InvariantCulture),
+                inpl.ToString("F2", CultureInfo.InvariantCulture),
+                depth.ToString("F2", CultureInfo.InvariantCulture),
+                divergencia.ToString("F4", CultureInfo.InvariantCulture),
+                jaws.X1.ToString("F2", CultureInfo.InvariantCulture),
+                jaws.X2.ToString("F2", CultureInfo.InvariantCulture),
+                jaws.Y1.ToString("F2", CultureInfo.InvariantCulture),
+                jaws.Y2.ToString("F2", CultureInfo.InvariantCulture),
+                parTexto,
+                laminaA,
+                laminaB,
+                distanciaCm.ToString("F3", CultureInfo.InvariantCulture),
+                distanciaCm <= 0.0 ? "SI" : "no"
+            }));
         }
 
         // Deja constancia del modelo de apertura efectivamente usado. Si distintos haces usan
@@ -1065,11 +1218,83 @@ namespace VMS.TPS
             mainStack.Children.Add(new TextBlock { Text = "Acción Recomendada:", FontWeight = FontWeights.Bold, Margin = new Thickness(0, 0, 0, 2) });
             mainStack.Children.Add(new TextBlock { Text = riskEvaluator.Recommendation, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 16) });
 
-            Button botonAceptar = new Button { Content = "Aceptar", Width = 100, Padding = new Thickness(4), HorizontalAlignment = HorizontalAlignment.Right };
+            StackPanel botonera = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
+
+            if (beamAuditor.ValidationRows.Count > 0)
+            {
+                Button botonExportar = new Button
+                {
+                    Content = "Exportar validación...",
+                    Width = 160,
+                    Padding = new Thickness(4),
+                    Margin = new Thickness(0, 0, 8, 0),
+                    ToolTip = "Guarda una tabla por control point con los valores intermedios de la " +
+                              "transformación geométrica, para contrastarla contra la vista BEV de Eclipse."
+                };
+                botonExportar.Click += (sender, args) => ExportValidation(beamAuditor, detectedCied);
+                botonera.Children.Add(botonExportar);
+            }
+
+            Button botonAceptar = new Button { Content = "Aceptar", Width = 100, Padding = new Thickness(4) };
             botonAceptar.Click += (sender, args) => Close();
-            mainStack.Children.Add(botonAceptar);
+            botonera.Children.Add(botonAceptar);
+
+            mainStack.Children.Add(botonera);
 
             Content = mainStack;
+        }
+
+        private void ExportValidation(CiedBeamAuditor beamAuditor, Structure detectedCied)
+        {
+            try
+            {
+                SaveFileDialog dialogo = new SaveFileDialog
+                {
+                    Title = "Guardar volcado de validación geométrica",
+                    Filter = "Texto delimitado por tabulación (*.tsv)|*.tsv|Todos los archivos (*.*)|*.*",
+                    FileName = string.Format(
+                      "CiedSafetyAuditor_validacion_{0}_{1:yyyyMMdd_HHmmss}.tsv",
+                      detectedCied.Id,
+                      DateTime.Now
+                    )
+                };
+
+                if (dialogo.ShowDialog() != true)
+                {
+                    return;
+                }
+
+                StringBuilder contenido = new StringBuilder();
+                contenido.AppendLine("# ESAPI CiedSafetyAuditor - volcado de validación geométrica");
+                contenido.AppendLine("# Estructura: " + detectedCied.Id);
+                contenido.AppendLine("# Apertura evaluada: " + beamAuditor.ApertureModelDescription);
+                contenido.AppendLine("# Distancias en mm salvo DistMin_cm. Centro* = proyección del centro de la caja envolvente del CIED.");
+                contenido.AppendLine("#");
+                contenido.AppendLine(CiedBeamAuditor.ValidationHeader);
+
+                foreach (string fila in beamAuditor.ValidationRows)
+                {
+                    contenido.AppendLine(fila);
+                }
+
+                File.WriteAllText(dialogo.FileName, contenido.ToString(), Encoding.UTF8);
+
+                MessageBox.Show(
+                  string.Format("Volcado guardado con {0} filas en:\n\n{1}", beamAuditor.ValidationRows.Count, dialogo.FileName),
+                  "Validación Exportada",
+                  MessageBoxButton.OK,
+                  MessageBoxImage.Information
+                );
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(
+                  "No se pudo guardar el volcado de validación:\n\n" + ex.Message,
+                  "Error al Exportar",
+                  MessageBoxButton.OK,
+                  MessageBoxImage.Error
+                );
+            }
         }
 
         private UIElement BuildItemRow(string etiqueta, string valor, string textoUmbral, string nivel)
